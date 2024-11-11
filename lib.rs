@@ -263,6 +263,7 @@ impl AppState {
         // Initialize database tables with updated schema
         sqlx::query(
             r#"
+
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
                 username VARCHAR(255) UNIQUE NOT NULL,
@@ -270,6 +271,16 @@ impl AppState {
                 kyber_public_key TEXT NOT NULL,
                 dilithium_public_key TEXT NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS user_locations (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                country_code VARCHAR(2) NOT NULL,
+                ip_address VARCHAR(45) NOT NULL,
+                security_level VARCHAR(20) NOT NULL,
+                last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id)
             );
 
             CREATE TABLE IF NOT EXISTS message_metadata (
@@ -314,6 +325,13 @@ impl AppState {
     ) -> Result<User, Box<dyn std::error::Error>> {
         let password_hash = hash(signup.password.as_bytes(), DEFAULT_COST)?;
 
+        // Verify location
+        let location = self.verify_location(&signup.ip_address).await?;
+
+        // Start transaction
+        let mut tx = self.db.begin().await?;
+
+        // Create user
         let user = sqlx::query_as!(
             User,
             r#"
@@ -329,19 +347,67 @@ impl AppState {
             signup.kyber_public_key,
             signup.dilithium_public_key,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut tx)
         .await?;
 
+        // Store location information
+        sqlx::query!(
+            r#"
+            INSERT INTO user_locations (
+                user_id, country_code, ip_address, security_level
+            )
+            VALUES ($1, $2, $3, $4)
+            "#,
+            user.id,
+            location.country_code,
+            location.ip_address,
+            format!("{:?}", location.security_level),
+        )
+        .execute(&mut tx)
+        .await?;
+
+        tx.commit().await?;
+
         Ok(user)
+    }
+
+    async fn verify_location(
+        &self,
+        ip_address: &str,
+    ) -> Result<UserLocation, Box<dyn std::error::Error>> {
+        // Use a geolocation service (like MaxMind) to verify IP
+        let location = match geoip2::lookup_ip(ip_address) {
+            Ok(loc) => loc,
+            Err(_) => return Err("Failed to verify location".into()),
+        };
+
+        let country_code = location.country.code.to_uppercase();
+        let security_level = match country_code.as_str() {
+            "DO" => SecurityLevel::Maximum,  // Dominican Republic
+            // Add more countries as they become available
+            _ => SecurityLevel::Standard,
+        };
+
+        Ok(UserLocation {
+            country_code,
+            ip_address: ip_address.to_string(),
+            security_level,
+        })
     }
 
     async fn authenticate_user(
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<User>, Box<dyn std::error::Error>> {
+        ip_address: &str,
+    ) -> Result<Option<(User, SecurityLevel)>, Box<dyn std::error::Error>> {
         let user_data = sqlx::query!(
-            "SELECT * FROM users WHERE username = $1",
+            r#"
+            SELECT u.*, ul.country_code, ul.security_level
+            FROM users u
+            JOIN user_locations ul ON u.id = ul.user_id
+            WHERE u.username = $1
+            "#,
             username
         )
         .fetch_optional(&self.db)
@@ -349,11 +415,25 @@ impl AppState {
 
         if let Some(user) = user_data {
             if verify(password, &user.password_hash)? {
-                Ok(Some(User {
-                    id: user.id,
-                    username: user.username,
-                    public_key: user.public_key,
-                }))
+                // Verify current location
+                let current_location = self.verify_location(ip_address).await?;
+
+                // Check if security level needs to be adjusted
+                let security_level = if current_location.country_code == user.country_code {
+                    user.security_level.parse::<SecurityLevel>().unwrap_or(SecurityLevel::Standard)
+                } else {
+                    SecurityLevel::Standard
+                };
+
+                Ok(Some((
+                    User {
+                        id: user.id,
+                        username: user.username,
+                        kyber_public_key: user.kyber_public_key,
+                        dilithium_public_key: user.dilithium_public_key,
+                    },
+                    security_level,
+                )))
             } else {
                 Ok(None)
             }
@@ -365,21 +445,26 @@ impl AppState {
     async fn store_message_metadata(
         &self,
         metadata: &MessageMetadata,
+        security_level: &SecurityLevel,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        sqlx::query!(
-            r#"
-            INSERT INTO message_metadata (
-                sender, recipient, timestamp, message_type
+        // Only store metadata for non-Maximum security or when explicitly requested
+        if !matches!(security_level, SecurityLevel::Maximum) {
+            sqlx::query!(
+                r#"
+                INSERT INTO message_metadata (
+                    sender, recipient, timestamp, message_type, security_level
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                "#,
+                metadata.sender,
+                metadata.recipient,
+                metadata.timestamp,
+                metadata.message_type,
+                format!("{:?}", security_level),
             )
-            VALUES ($1, $2, $3, $4)
-            "#,
-            metadata.sender,
-            metadata.recipient,
-            metadata.timestamp,
-            metadata.message_type,
-        )
-        .execute(&self.db)
-        .await?;
+            .execute(&self.db)
+            .await?;
+        }
 
         Ok(())
     }
@@ -389,42 +474,58 @@ impl AppState {
         sender: &str,
         recipient: &str,
         encrypted_msg: &EncryptedMessage,
+        security_level: &SecurityLevel,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let expiry_time = encrypted_msg.ttl.map(|ttl| encrypted_msg.timestamp + ttl);
+        // Only store messages for non-Maximum security or when explicitly requested
+        if !matches!(security_level, SecurityLevel::Maximum) || encrypted_msg.store_message {
+            let expiry_time = encrypted_msg.ttl.map(|ttl| encrypted_msg.timestamp + ttl);
 
-        sqlx::query!(
-            r#"
-            INSERT INTO stored_messages (
-                sender, recipient, encrypted_content,
-                encrypted_key, nonce, timestamp, expiry_time,
-                message_hash
+            sqlx::query!(
+                r#"
+                INSERT INTO stored_messages (
+                    sender, recipient, encrypted_content,
+                    encapsulated_key, signature, nonce,
+                    timestamp, expiry_time, message_hash,
+                    security_level
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#,
+                sender,
+                recipient,
+                &encrypted_msg.content,
+                &encrypted_msg.encapsulated_key,
+                &encrypted_msg.signature,
+                &encrypted_msg.nonce,
+                encrypted_msg.timestamp,
+                expiry_time,
+                &encrypted_msg.message_hash,
+                format!("{:?}", security_level),
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
-            sender,
-            recipient,
-            &encrypted_msg.content,
-            &encrypted_msg.encrypted_key,
-            &encrypted_msg.nonce,
-            encrypted_msg.timestamp,
-            expiry_time,
-            &encrypted_msg.message_hash,
-        )
-        .execute(&self.db)
-        .await?;
+            .execute(&self.db)
+            .await?;
+        }
 
         Ok(())
     }
 
-    async fn get_public_key(&self, username: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let user = sqlx::query!(
-            "SELECT public_key FROM users WHERE username = $1",
+    async fn get_public_keys(
+        &self,
+        username: &str,
+    ) -> Result<UserKeys, Box<dyn std::error::Error>> {
+        let keys = sqlx::query!(
+            r#"
+            SELECT kyber_public_key, dilithium_public_key
+            FROM users WHERE username = $1
+            "#,
             username
         )
         .fetch_one(&self.db)
         .await?;
 
-        Ok(user.public_key)
+        Ok(UserKeys {
+            kyber_public_key: hex::decode(&keys.kyber_public_key)?,
+            dilithium_public_key: hex::decode(&keys.dilithium_public_key)?,
+        })
     }
 
     async fn cleanup_expired_messages(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -509,6 +610,10 @@ async fn handle_websocket(
         },
     );
 
+    // Forward messages from the receiver to the WebSocket
+    let forward_task = receiver.map(Ok).forward(ws_sender);
+    tokio::spawn(forward_task);
+
     // Handle incoming messages
     while let Some(result) = ws_receiver.next().await {
         match result {
@@ -528,7 +633,7 @@ async fn handle_websocket(
                     }
                 }
 
-                // Get recipient's connection and security level
+                // Get recipient's connection and keys
                 let recipient_conn = state
                     .active_connections
                     .read()
@@ -536,33 +641,48 @@ async fn handle_websocket(
                     .get(&message.recipient)
                     .cloned();
 
+                // Get recipient's public keys (from active connection or database)
+                let recipient_keys = if let Some(conn) = &recipient_conn {
+                    conn.keys.clone()
+                } else {
+                    match sqlx::query!(
+                        "SELECT kyber_public_key, dilithium_public_key FROM users WHERE username = $1",
+                        message.recipient
+                    )
+                    .fetch_one(&state.db)
+                    .await {
+                        Ok(keys) => UserKeys {
+                            kyber_public_key: hex::decode(&keys.kyber_public_key).unwrap_or_default(),
+                            dilithium_public_key: hex::decode(&keys.dilithium_public_key).unwrap_or_default(),
+                        },
+                        Err(_) => continue,
+                    }
+                };
+
                 // Choose encryption method based on security level
                 let encrypted = match security_level {
                     SecurityLevel::Maximum => {
-                        // Use quantum-resistant encryption
                         CryptoUtils::encrypt_message(
                             message.content.as_bytes(),
                             &recipient_keys.kyber_public_key,
                             &user_keys.dilithium_public_key,
                             message.ttl,
                             message.store_message,
-                        )?
+                        ).unwrap_or_else(|_| return)
                     },
                     SecurityLevel::Standard => {
-                        // Use regular end-to-end encryption
                         CryptoUtils::encrypt_standard_message(
                             message.content.as_bytes(),
-                            &recipient_keys.standard_public_key,
+                            &recipient_keys.kyber_public_key,
                             message.ttl,
                             message.store_message,
-                        )?
+                        ).unwrap_or_else(|_| return)
                     },
                     SecurityLevel::Basic => {
-                        // Use basic encryption
                         CryptoUtils::encrypt_basic_message(
                             message.content.as_bytes(),
                             message.store_message,
-                        )?
+                        ).unwrap_or_else(|_| return)
                     },
                 };
 
